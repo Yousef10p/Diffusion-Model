@@ -221,7 +221,7 @@ with right_col:
     st.subheader("Model Metrics Logs")
     # Utilizing pre-rendered tracking visualizations present in your directory structure
     try:
-        st.image("loss_curve.png", caption="Training Convergence Loss Curve Tracker", use_container_width=True)
+        st.image("assets/loss_curve.png", caption="Training Convergence Loss Curve Tracker", use_container_width=True)
     except:
         st.info("💡 Note: Place your training `loss_curve.png` here to show historical performance.")
 
