@@ -116,7 +116,7 @@ class UNet(nn.Module):
         return self.out_conv(x)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 2. DIFFUSION SAMPLING HELPER
+# 2. DIFFUSION SAMPLING HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
 
 def get_sampling_constants(timesteps=1000, beta_start=1e-4, beta_end=0.02, device="cpu"):
@@ -127,34 +127,31 @@ def get_sampling_constants(timesteps=1000, beta_start=1e-4, beta_end=0.02, devic
     
     # Required calculation variants for extraction during reverse loop
     sqrt_recip_alphas = torch.sqrt(1.0 / alphas)
+    sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod) # Added for forward diffusion
     sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
     posterior_variance = betas * (1.0 - torch.cat([torch.tensor([1.0], device=device), alphas_cumprod[:-1]]) ) / (1.0 - alphas_cumprod)
     
-    return betas, sqrt_recip_alphas, sqrt_one_minus_alphas_cumprod, posterior_variance
+    return betas, sqrt_recip_alphas, sqrt_one_minus_alphas_cumprod, posterior_variance, sqrt_alphas_cumprod
 
 @torch.no_grad()
-def sample_ddpm(model, timesteps, constants, device, img_size=64, channels=3):
-    """Generates a novel image starting from pure Gaussian noise."""
-    betas, sqrt_recip_alphas, sqrt_one_minus_alphas_cumprod, posterior_variance = constants
+def sample_ddpm(model, timesteps, constants, device, batch_size=1, img_size=64, channels=3):
+    """Generates a batch of novel images starting from pure Gaussian noise."""
+    betas, sqrt_recip_alphas, sqrt_one_minus_alphas_cumprod, posterior_variance, _ = constants
     
-    # Start from pure noise x_T
-    x = torch.randn((1, channels, img_size, img_size), device=device)
-    
-    # Progress bar for Streamlit UI tracking
+    # Start from pure noise for the entire batch
+    x = torch.randn((batch_size, channels, img_size, img_size), device=device)
     progress_bar = st.progress(0.0)
     
     for i in reversed(range(0, timesteps)):
-        t = torch.tensor([i], device=device, dtype=torch.long)
+        # Provide time tensor mapped to the batch size explicitly
+        t = torch.full((batch_size,), i, device=device, dtype=torch.long)
         
-        # Predict noise using the U-Net
         predicted_noise = model(x, t)
         
-        # Retrieve needed schedule constants for step t
         alpha_t = sqrt_recip_alphas[i]
         beta_t = betas[i]
         sqrt_one_minus_alpha_cumprod_t = sqrt_one_minus_alphas_cumprod[i]
         
-        # Compute mean target equation
         model_mean = alpha_t * (x - beta_t * predicted_noise / sqrt_one_minus_alpha_cumprod_t)
         
         if i > 0:
@@ -164,35 +161,75 @@ def sample_ddpm(model, timesteps, constants, device, img_size=64, channels=3):
         else:
             x = model_mean
             
-        # Update progress bar
         progress_bar.progress((timesteps - i) / timesteps)
         
-    progress_bar.empty() # Clear when complete
+    progress_bar.empty()
     
-    # Post-process image to standard uint8 format [0, 255]
+    x = (x.clamp(-1, 1) + 1) / 2.0
+    x_np = (x.permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
+    
+    # Return list of PIL Images
+    return [Image.fromarray(img) for img in x_np]
+
+@torch.no_grad()
+def sample_ddpm_reconstruct(model, x_start, start_t, constants, device):
+    """Adds noise to an image up to step start_t, then reconstructs it."""
+    betas, sqrt_recip_alphas, sqrt_one_minus_alphas_cumprod, posterior_variance, sqrt_alphas_cumprod = constants
+    
+    # 1. Forward Diffusion: Add noise to the clean image up to step `start_t`
+    noise = torch.randn_like(x_start)
+    sqrt_alpha_cumprod_t = sqrt_alphas_cumprod[start_t]
+    sqrt_one_minus_alpha_cumprod_t = sqrt_one_minus_alphas_cumprod[start_t]
+    
+    x_noisy = sqrt_alpha_cumprod_t * x_start + sqrt_one_minus_alpha_cumprod_t * noise
+    x = x_noisy.clone() # This is the starting point for reverse diffusion
+    
+    # Prepare the noisy image for Streamlit display
+    display_noisy = (x_noisy.clamp(-1, 1) + 1) / 2.0
+    display_noisy = (display_noisy.permute(0, 2, 3, 1).cpu().numpy()[0] * 255).astype(np.uint8)
+    img_noisy = Image.fromarray(display_noisy)
+
+    # 2. Reverse Diffusion: Denoise back from `start_t` to 0
+    progress_bar = st.progress(0.0)
+    
+    for i in reversed(range(0, start_t)):
+        t = torch.tensor([i], device=device, dtype=torch.long)
+        
+        predicted_noise = model(x, t)
+        
+        alpha_t = sqrt_recip_alphas[i]
+        beta_t = betas[i]
+        sqrt_one_minus_alpha_cumprod_i = sqrt_one_minus_alphas_cumprod[i]
+        
+        model_mean = alpha_t * (x - beta_t * predicted_noise / sqrt_one_minus_alpha_cumprod_i)
+        
+        if i > 0:
+            step_noise = torch.randn_like(x)
+            variance = torch.sqrt(posterior_variance[i]) * step_noise
+            x = model_mean + variance
+        else:
+            x = model_mean
+            
+        progress_bar.progress((start_t - i) / start_t)
+        
+    progress_bar.empty()
+    
     x = (x.clamp(-1, 1) + 1) / 2.0
     x = (x.permute(0, 2, 3, 1).cpu().numpy()[0] * 255).astype(np.uint8)
-    return Image.fromarray(x)
+    return img_noisy, Image.fromarray(x)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 3. STREAMLIT APPLICATION USER INTERFACE
 # ──────────────────────────────────────────────────────────────────────────────
 
-st.set_page_config(page_title="DDPM Face Generator", layout="centered")
+st.set_page_config(page_title="DDPM Generator", layout="centered")
 
-st.title("DDPM Image Generation Dashboard")
-st.caption("Generate realistic synthetic images using a custom PyTorch DDPM U-Net pipeline.")
-
-# Use GPU acceleration if system infrastructure permits
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Load Model using Cached mechanisms so it doesn't re-trigger on user clicks
 @st.cache_resource
 def load_trained_model():
-    # Structural setup matching architecture design dimensions (img_ch=3, model_dim=64, time_dim=256)
     net = UNet(img_ch=3, model_dim=64, time_emb_dim=256)
     try:
-        # Load weights mapping to current hardware infrastructure
         state_dict = torch.load("ddpm_unet.pth", map_location=device)
         net.load_state_dict(state_dict)
         net.to(device)
@@ -203,40 +240,98 @@ def load_trained_model():
 
 model, success = load_trained_model()
 
-# Create layout columns for parameters and reference history visual logs
-left_col, right_col = st.columns([1, 1])
+# ── Navigation Sidebar ──
+st.sidebar.title("Navigation")
+app_mode = st.sidebar.radio("Choose Mode:", ["Unconditional Generation"])
 
-with left_col:
-    st.subheader("Generation Settings")
-    total_steps = st.slider("Diffusion Steps (T)", min_value=100, max_value=1000, value=1000, step=100)
-    
+if app_mode == "Unconditional Generation":
+    st.title("DDPM Image Generation Dashboard")
+    st.caption("Generate realistic synthetic images using a custom PyTorch DDPM U-Net pipeline.")
+
+    left_col, right_col = st.columns([1, 1])
+
+    with left_col:
+        st.subheader("Generation Settings")
+        total_steps = st.slider("Diffusion Steps (T)", min_value=100, max_value=1000, value=1000, step=100)
+        batch_size = st.number_input("Number of Images (Batch Size)", min_value=1, max_value=16, value=1)
+        
+        if not success:
+            st.error(f"Failed to find or load `ddpm_unet.pth`. Error: {model}")
+            generate_btn = st.button("Generate Image(s)", disabled=True)
+        else:
+            st.success("Model Weights Loaded Successfully!")
+            generate_btn = st.button("✨ Generate Image(s)", type="primary")
+
+    with right_col:
+        st.subheader("Model Metrics Logs")
+        try:
+            st.image("assets/loss_curve.png", caption="Training Convergence Loss Curve Tracker", use_container_width=True)
+        except:
+            st.info("💡 Note: Place your training `loss_curve.png` here to show historical performance.")
+
+    if generate_btn and success:
+        st.subheader("Generating Assets...")
+        with st.spinner(f"Processing Reverse Diffusion over {batch_size} image(s)..."):
+            schedule_constants = get_sampling_constants(timesteps=total_steps, device=device)
+            generated_images = sample_ddpm(
+                model, 
+                timesteps=total_steps, 
+                constants=schedule_constants, 
+                device=device,
+                batch_size=batch_size
+            )
+            
+            st.success("Generation Complete!")
+            
+            # Display generated batch cleanly in columns (up to 4 images per row)
+            cols = st.columns(min(batch_size, 4))
+            for idx, img in enumerate(generated_images):
+                with cols[idx % 4]:
+                    st.image(img, use_container_width=True, caption=f"Sample {idx+1}")
+
+elif app_mode == "Image Reconstruction":
+    st.title("DDPM Image Reconstruction")
+    st.caption("Upload an image, apply forward diffusion (noise), and use the U-Net to denoise and reconstruct it.")
+
     if not success:
         st.error(f"Failed to find or load `ddpm_unet.pth`. Error: {model}")
-        generate_btn = st.button("Generate Image", disabled=True)
     else:
-        st.success("Model Weights Loaded Successfully!")
-        generate_btn = st.button("✨ Generate Face Image", type="primary")
-
-with right_col:
-    st.subheader("Model Metrics Logs")
-    # Utilizing pre-rendered tracking visualizations present in your directory structure
-    try:
-        st.image("assets/loss_curve.png", caption="Training Convergence Loss Curve Tracker", use_container_width=True)
-    except:
-        st.info("💡 Note: Place your training `loss_curve.png` here to show historical performance.")
-
-
-
-if generate_btn and success:
-    st.subheader("" \
-    "Generating Asset...")
-    with st.spinner("Processing Reverse Diffusion Markov Chain steps..."):
-        # Fetch configurations
-        schedule_constants = get_sampling_constants(timesteps=total_steps, device=device)
+        uploaded_file = st.file_uploader("Upload an image...", type=["png", "jpg", "jpeg"])
+        noise_timestep = st.slider("Noise Level (Timestep)", min_value=10, max_value=999, value=300, step=10)
         
-        # Run process
-        generated_img = sample_ddpm(model, timesteps=total_steps, constants=schedule_constants, device=device)
-        
-        # Present Output
-        st.success("Generation Complete!")
-        st.image(generated_img, caption=f"Generated Shape Output (Dim: 64x64 over {total_steps} Steps)", width=300)
+        if uploaded_file is not None:
+            # Preprocess the uploaded image
+            raw_img = Image.open(uploaded_file).convert("RGB")
+            resized_img = raw_img.resize((64, 64))
+            
+            # Show original resized image
+            st.subheader("Original Image (Resized to 64x64)")
+            st.image(resized_img, width=200)
+
+            # Convert to normalized tensor [-1, 1]
+            img_np = np.array(resized_img) / 255.0
+            img_np = img_np * 2.0 - 1.0
+            x_start = torch.tensor(img_np, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(device)
+
+            reconstruct_btn = st.button("🔄 Add Noise & Reconstruct", type="primary")
+
+            if reconstruct_btn:
+                with st.spinner("Applying Forward & Reverse Diffusion..."):
+                    # We pass 1000 for total sequence to get correct schedules, but start diffusing from `noise_timestep`
+                    schedule_constants = get_sampling_constants(timesteps=1000, device=device)
+                    
+                    noisy_img, reconstructed_img = sample_ddpm_reconstruct(
+                        model, 
+                        x_start, 
+                        start_t=noise_timestep, 
+                        constants=schedule_constants, 
+                        device=device
+                    )
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.subheader(f"Noised (t={noise_timestep})")
+                        st.image(noisy_img, use_container_width=True)
+                    with col2:
+                        st.subheader("Reconstructed")
+                        st.image(reconstructed_img, use_container_width=True)
